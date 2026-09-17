@@ -18,8 +18,8 @@ use std::{
 use rmcp::{
     ClientLifecycleMode, ClientServiceExt, ServerHandler,
     model::{
-        ClientCapabilities, ClientInfo, ClientRequest, DetailedTask, Implementation,
-        ListToolsRequest, ProtocolVersion, RequestMetaObject, ServerCapabilities, ServerInfo,
+        ClientCapabilities, ClientConfig, ClientRequest, DetailedTask, Implementation,
+        ListToolsRequest, ProtocolVersion, RequestMetaObject, ServerCapabilities, ServerConfig,
         ServerNotification, SubscriptionFilter, Task, TaskPayload, TaskStatus,
     },
     service::{PeerRequestOptions, SubscriptionContext, SubscriptionEnd},
@@ -53,8 +53,8 @@ impl ServerHandler for HttpSubscriptionServer {
         Cow::Borrowed(&[ProtocolVersion::V_2026_07_28, ProtocolVersion::V_2025_11_25])
     }
 
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_tool_list_changed()
@@ -185,7 +185,7 @@ async fn modern_http_listen_uses_post_stream_and_cancels_by_closing_it() -> anyh
     let transport = StreamableHttpClientTransport::from_config(
         StreamableHttpClientTransportConfig::with_uri(url.clone()),
     );
-    let client = ClientInfo::default()
+    let client = ClientConfig::default()
         .serve_with_lifecycle(
             transport,
             ClientLifecycleMode::Discover {
@@ -230,7 +230,7 @@ async fn modern_http_graceful_close_returns_final_listen_result() -> anyhow::Res
     let transport = StreamableHttpClientTransport::from_config(
         StreamableHttpClientTransportConfig::with_uri(url),
     );
-    let client = ClientInfo::default()
+    let client = ClientConfig::default()
         .serve_with_lifecycle(
             transport,
             ClientLifecycleMode::Discover {
@@ -266,7 +266,7 @@ async fn modern_http_delivers_task_status_on_the_listen_stream() -> anyhow::Resu
     let transport = StreamableHttpClientTransport::from_config(
         StreamableHttpClientTransportConfig::with_uri(url),
     );
-    let client = ClientInfo::new(
+    let client = ClientConfig::new(
         ClientCapabilities::builder().enable_tasks().build(),
         Implementation::new("http-tasks-client", "1.0.0"),
     )
@@ -309,7 +309,7 @@ async fn modern_http_stream_close_without_result_is_abrupt() -> anyhow::Result<(
     let transport = StreamableHttpClientTransport::from_config(
         StreamableHttpClientTransportConfig::with_uri(url),
     );
-    let client = ClientInfo::default()
+    let client = ClientConfig::default()
         .serve_with_lifecycle(
             transport,
             ClientLifecycleMode::Discover {
@@ -342,7 +342,7 @@ async fn modern_http_lifecycle_stays_sessionless_for_older_application_version()
     let transport = StreamableHttpClientTransport::from_config(
         StreamableHttpClientTransportConfig::with_uri(url),
     );
-    let client = ClientInfo::default()
+    let client = ClientConfig::default()
         .serve_with_lifecycle(
             transport,
             ClientLifecycleMode::Discover {

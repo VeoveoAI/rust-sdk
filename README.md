@@ -99,10 +99,10 @@ Use [`ClientServiceExt::serve_with_lifecycle`](crates/rmcp/src/service/client.rs
 select another lifecycle explicitly:
 
 ```rust, ignore
-use rmcp::{ClientInfo, ClientLifecycleMode, ClientServiceExt, ProtocolVersion};
+use rmcp::{ClientLifecycleMode, ClientServiceExt, ProtocolVersion, model::ClientConfig};
 
 // Start directly with server/discover and include client metadata on every request.
-let client = ClientInfo::default()
+let client = ClientConfig::default()
     .serve_with_lifecycle(
         transport,
         ClientLifecycleMode::Discover {
@@ -113,7 +113,7 @@ let client = ClientInfo::default()
 
 // Or probe the discover lifecycle and fall back when a legacy server reports
 // that server/discover is not implemented or does not respond within 10 seconds.
-let client = ClientInfo::default()
+let client = ClientConfig::default()
     .serve_with_lifecycle(
         transport,
         ClientLifecycleMode::Auto {
@@ -369,8 +369,8 @@ use serde_json::json;
 struct MyServer;
 
 impl ServerHandler for MyServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(
             ServerCapabilities::builder()
                 .enable_resources()
                 .build(),
@@ -582,8 +582,8 @@ impl MyServer {
 
 #[prompt_handler]
 impl ServerHandler for MyServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_prompts().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_prompts().build())
     }
 }
 ```
@@ -934,8 +934,8 @@ Enable the logging capability, handle level changes from the client, and send lo
 use rmcp::{ServerHandler, model::*, service::RequestContext};
 
 impl ServerHandler for MyServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(
             ServerCapabilities::builder()
                 .enable_logging()
                 .build(),
@@ -1007,8 +1007,8 @@ Enable the completions capability and implement the `complete()` handler. Use `r
 use rmcp::{ErrorData as McpError, ServerHandler, model::*, service::RequestContext, RoleServer};
 
 impl ServerHandler for MyServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(
             ServerCapabilities::builder()
                 .enable_completions()
                 .enable_prompts()
@@ -1253,8 +1253,8 @@ use rmcp::{
 };
 
 impl ServerHandler for MyServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_tool_list_changed()
@@ -1366,11 +1366,21 @@ async fn call_tool(&self, request: CallToolRequestParams, _ctx: RequestContext<R
 }
 ```
 
-> **`requestState` is untrusted.** The client echoes it back verbatim, so a
-> stateless server that stores meaningful data in it MUST verify integrity
-> first. Enable the `request-state` feature and use `RequestStateCodec` to seal
-> and open it (HMAC-tagged), or keep state server-side and use `requestState`
-> only as an opaque handle.
+> **`requestState` is untrusted.** [SEP-2322 requires servers to validate
+> it](https://modelcontextprotocol.io/seps/2322-MRTR#protocol-requirements-for-ephemeral-workflow)
+> because the client echoes it back verbatim. A stateless server that stores
+> meaningful data in it MUST verify integrity first. Enable the `request-state`
+> feature and use `RequestStateCodec` to seal and open it (HMAC-tagged), or keep
+> state server-side and use `requestState` only as an opaque handle.
+
+For multi-replica deployments, use `RequestStateCodec::new_with_keyring` to
+rotate signing keys without invalidating in-flight requests:
+
+1. Deploy the old and new keys everywhere, continuing to emit `rs1` with the
+   old key via `with_rs1_signing("old")`.
+2. Start emitting `rs2` with the new key while retaining the old key via
+   `with_rs1_fallback("old")`.
+3. After the maximum `requestState` lifetime has elapsed, remove the old key.
 
 ### Client-side
 
@@ -1599,7 +1609,7 @@ use rmcp::transport::StreamableHttpClientTransport;
 
 // Defaults are stateless-friendly.
 let transport = StreamableHttpClientTransport::from_uri("http://localhost:8000/mcp");
-let client = ClientInfo::default().serve(transport).await?;
+let client = ClientConfig::default().serve(transport).await?;
 ```
 
 **Example:** [`examples/servers/src/counter_streamhttp.rs`](examples/servers/src/counter_streamhttp.rs) (server), [`examples/clients/src/streamable_http.rs`](examples/clients/src/streamable_http.rs) (client)
@@ -1653,8 +1663,26 @@ server example). The client transport connects with a single URI:
 use rmcp::transport::StreamableHttpClientTransport;
 
 let transport = StreamableHttpClientTransport::from_uri("http://localhost:8000/mcp");
-let client = ClientInfo::default().serve(transport).await?;
+let client = ClientConfig::default().serve(transport).await?;
 ```
+
+The client allows up to 16 ordinary http POSTs at once. Configure this with
+`StreamableHttpClientTransportConfig::with_uri(url).max_concurrent_requests(n)`;
+`1` keeps ordinary POSTs serial, and `0` is treated as `1`. An open sse response
+stream does not count against this limit. Cancellation and replies use a
+separate queue with one extra POST slot. Configure their timeout with
+`control_request_timeout` (default: five seconds). The timeout starts when the
+POST starts, excluding time in the queue. Cancellation stops a queued or active
+POST immediately.
+For an open legacy response stream, the client stops reading but keeps the stream
+alive until the cancellation send finishes or is dropped. This lets custom http
+adapters handle cancellation before their stream state is removed.
+
+Session recovery waits up to five seconds for old POSTs, then stops any that
+remain. Those POSTs are not retried because the server may have processed them.
+Configure this wait and the separate
+reinitialization timeout with `session_recovery_timeout`. Callers still decide
+which tools may run at the same time and which need approval.
 
 #### Server-Sent Events (SSE)
 
@@ -1739,10 +1767,10 @@ knows what the other supports. Declare yours with the `ServerCapabilities`
 builder in `get_info()`:
 
 ```rust,ignore
-use rmcp::model::{ServerCapabilities, ServerInfo};
+use rmcp::model::{ServerCapabilities, ServerConfig};
 
-fn get_info(&self) -> ServerInfo {
-    ServerInfo::new(
+fn get_info(&self) -> ServerConfig {
+    ServerConfig::new(
         ServerCapabilities::builder()
             .enable_tools()
             .enable_prompts()

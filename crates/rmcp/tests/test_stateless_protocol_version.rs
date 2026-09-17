@@ -1,7 +1,8 @@
 //! Tests for protocol version negotiation in stateless HTTP mode.
 //!
-//! Supported versions are echoed back; unknown versions, and versions outside
-//! the server's `supported_protocol_versions`, fall back to the handler's own
+//! Supported handshake versions are echoed back; unknown versions, versions
+//! outside the server's `supported_protocol_versions`, and versions that no
+//! longer have an `initialize` handshake fall back to the handler's own
 //! version.
 #![cfg(not(feature = "local"))]
 
@@ -10,7 +11,8 @@ use std::borrow::Cow;
 use rmcp::{
     ErrorData, RoleServer, ServerHandler,
     model::{
-        InitializeRequestParams, InitializeResult, ProtocolVersion, ServerCapabilities, ServerInfo,
+        InitializeRequestParams, InitializeResult, ProtocolVersion, ServerCapabilities,
+        ServerConfig,
     },
     service::RequestContext,
     transport::streamable_http_server::{
@@ -23,8 +25,8 @@ use tokio_util::sync::CancellationToken;
 struct OverridingInitialize;
 
 impl ServerHandler for OverridingInitialize {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::default())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::default())
     }
 
     async fn initialize(
@@ -36,9 +38,10 @@ impl ServerHandler for OverridingInitialize {
     }
 }
 
-/// Every known version except `2026-07-28`, standing in for a server that has
-/// not implemented that revision.
-const NARROWED_VERSIONS: &[ProtocolVersion] = &[
+/// Every known version whose lifecycle still runs the `initialize` handshake.
+/// `2026-07-28` replaced the handshake with per-request metadata, so this is
+/// also the list a server that has not implemented that revision supports.
+const HANDSHAKE_VERSIONS: &[ProtocolVersion] = &[
     ProtocolVersion::V_2024_11_05,
     ProtocolVersion::V_2025_03_26,
     ProtocolVersion::V_2025_06_18,
@@ -51,12 +54,12 @@ const NARROWED_VERSIONS: &[ProtocolVersion] = &[
 struct NarrowedOverridingInitialize;
 
 impl ServerHandler for NarrowedOverridingInitialize {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::default())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::default())
     }
 
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
-        Cow::Borrowed(NARROWED_VERSIONS)
+        Cow::Borrowed(HANDSHAKE_VERSIONS)
     }
 
     async fn initialize(
@@ -148,15 +151,15 @@ async fn post_init(client: &reqwest::Client, url: &str, body_version: &str) -> s
 }
 
 #[tokio::test]
-async fn stateless_json_init_echoes_known_versions_when_handler_overrides_initialize() {
+async fn stateless_json_init_echoes_handshake_versions_when_handler_overrides_initialize() {
     let (client, url, ct) = spawn_server(stateless_json_config()).await;
 
-    for version in ProtocolVersion::KNOWN_VERSIONS {
+    for version in HANDSHAKE_VERSIONS {
         let resp = post_init(&client, &url, version.as_str()).await;
         assert_eq!(
             resp["result"]["protocolVersion"],
             version.as_str(),
-            "known version {version} should be echoed back"
+            "handshake version {version} should be echoed back"
         );
     }
 
@@ -164,15 +167,15 @@ async fn stateless_json_init_echoes_known_versions_when_handler_overrides_initia
 }
 
 #[tokio::test]
-async fn stateless_sse_init_echoes_known_versions_when_handler_overrides_initialize() {
+async fn stateless_sse_init_echoes_handshake_versions_when_handler_overrides_initialize() {
     let (client, url, ct) = spawn_server(stateless_sse_config()).await;
 
-    for version in ProtocolVersion::KNOWN_VERSIONS {
+    for version in HANDSHAKE_VERSIONS {
         let resp = post_init(&client, &url, version.as_str()).await;
         assert_eq!(
             resp["result"]["protocolVersion"],
             version.as_str(),
-            "known version {version} should be echoed back"
+            "handshake version {version} should be echoed back"
         );
     }
 
@@ -198,7 +201,7 @@ async fn stateless_json_init_echoes_versions_the_server_narrowed_to() {
     let (client, url, ct) =
         spawn_server_of::<NarrowedOverridingInitialize>(stateless_json_config()).await;
 
-    for version in NARROWED_VERSIONS {
+    for version in HANDSHAKE_VERSIONS {
         let resp = post_init(&client, &url, version.as_str()).await;
         assert_eq!(
             resp["result"]["protocolVersion"],

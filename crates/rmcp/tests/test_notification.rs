@@ -6,7 +6,7 @@ use rmcp::{
     ClientHandler, ServerHandler, ServiceExt,
     model::{
         ClientNotification, CustomNotification, ResourceUpdatedNotificationParam,
-        ServerCapabilities, ServerInfo, ServerNotification, SubscribeRequestParams,
+        ServerCapabilities, ServerConfig, ServerNotification, SubscribeRequestParams,
     },
 };
 use serde_json::json;
@@ -16,8 +16,8 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 struct Server {}
 
 impl ServerHandler for Server {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(
             ServerCapabilities::builder()
                 .enable_resources()
                 .enable_resources_subscribe()

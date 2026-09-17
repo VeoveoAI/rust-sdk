@@ -13,13 +13,13 @@ use super::*;
 use crate::model::{ElicitRequest, ElicitRequestParams, ElicitResult, ElicitationAction};
 use crate::{
     model::{
-        CancelledNotification, CancelledNotificationParam, ClientInfo, ClientJsonRpcMessage,
+        CancelledNotification, CancelledNotificationParam, ClientJsonRpcMessage,
         ClientNotification, ClientRequest, ClientResult, CreateMessageRequest,
         CreateMessageRequestParams, CreateMessageResult, DetailedTask, EmptyResult, ErrorData,
-        ListRootsRequest, ListRootsResult, LoggingMessageNotification,
+        InitializeRequestParams, ListRootsRequest, ListRootsResult, LoggingMessageNotification,
         LoggingMessageNotificationParam, ProgressNotification, ProgressNotificationParam,
         PromptListChangedNotification, ProtocolVersion, ResourceListChangedNotification,
-        ResourceUpdatedNotification, ResourceUpdatedNotificationParam, ServerInfo,
+        ResourceUpdatedNotification, ResourceUpdatedNotificationParam, ServerConfig,
         ServerNotification, ServerRequest, ServerResult, SubscriptionFilter,
         SubscriptionsAcknowledgedNotification, SubscriptionsAcknowledgedNotificationParams,
         TaskStatusNotification, TaskStatusNotificationParams, ToolListChangedNotification,
@@ -38,8 +38,8 @@ impl ServiceRole for RoleServer {
     type PeerReq = ClientRequest;
     type PeerResp = ClientResult;
     type PeerNot = ClientNotification;
-    type Info = ServerInfo;
-    type PeerInfo = ClientInfo;
+    type Info = ServerConfig;
+    type PeerInfo = InitializeRequestParams;
 
     type InitializeError = ServerInitializeError;
     const IS_CLIENT: bool = false;
@@ -477,27 +477,62 @@ where
     }
 }
 
-/// Echoes the client-requested version if the server supports it; otherwise
-/// returns `server_fallback`.
+/// Echoes the client-requested version if the server can serve it over the
+/// `initialize` handshake; otherwise returns a legacy version the server does
+/// support.
 ///
 /// `server_supported` comes from [`Service::supported_protocol_versions`], so a
 /// server that narrows that list is never made to answer `initialize` with a
-/// version it cannot serve.
+/// version it cannot serve. `2026-07-28` replaced the handshake with
+/// per-request metadata, so a client naming that revision or later is answered
+/// with the server's newest legacy version instead.
+///
+/// # Errors
+///
+/// Returns [`ErrorCode::UNSUPPORTED_PROTOCOL_VERSION`] when the server supports
+/// no version that still has an `initialize` handshake.
+///
+/// [`ErrorCode::UNSUPPORTED_PROTOCOL_VERSION`]: crate::model::ErrorCode::UNSUPPORTED_PROTOCOL_VERSION
 pub(crate) fn negotiate_protocol_version(
     client_requested: &ProtocolVersion,
     server_fallback: ProtocolVersion,
     server_supported: &[ProtocolVersion],
-) -> ProtocolVersion {
-    if server_supported.contains(client_requested) {
-        client_requested.clone()
+) -> Result<ProtocolVersion, ErrorData> {
+    if is_legacy_version(client_requested) && server_supported.contains(client_requested) {
+        return Ok(client_requested.clone());
+    }
+    let legacy_fallback = if is_legacy_version(&server_fallback) {
+        Some(server_fallback)
     } else {
+        newest_legacy_version(server_supported)
+    };
+    let Some(legacy_fallback) = legacy_fallback else {
         tracing::warn!(
             client_requested = %client_requested,
-            server_fallback = %server_fallback,
-            "client requested unsupported protocol version; falling back to server default"
+            "server supports no protocol version with an initialize handshake; rejecting"
         );
-        server_fallback
-    }
+        return Err(ErrorData::unsupported_protocol_version(
+            client_requested.clone(),
+            server_supported,
+        ));
+    };
+    // Falling back is the designed answer for a pinned client, and stateless
+    // HTTP re-runs it on every request, so this is not a warning.
+    tracing::debug!(
+        client_requested = %client_requested,
+        server_fallback = %legacy_fallback,
+        "client requested a protocol version unavailable over initialize; falling back to server default"
+    );
+    Ok(legacy_fallback)
+}
+
+/// The newest of `versions` that still has an `initialize` handshake.
+fn newest_legacy_version(versions: &[ProtocolVersion]) -> Option<ProtocolVersion> {
+    versions
+        .iter()
+        .filter(|version| is_legacy_version(version))
+        .max_by(|left, right| left.as_str().cmp(right.as_str()))
+        .cloned()
 }
 
 fn missing_request_metadata_error(missing: &[&str]) -> ErrorData {
@@ -508,6 +543,27 @@ fn missing_request_metadata_error(missing: &[&str]) -> ErrorData {
         ),
         None,
     )
+}
+
+/// Sends `error` as the response to the `initialize` request and reports it as
+/// the reason the handshake failed.
+async fn report_initialize_failure<T>(
+    transport: &mut T,
+    error: ErrorData,
+    id: RequestId,
+) -> ServerInitializeError
+where
+    T: Transport<RoleServer> + 'static,
+{
+    match transport
+        .send(ServerJsonRpcMessage::error(error.clone(), Some(id)))
+        .await
+    {
+        Ok(()) => ServerInitializeError::InitializeFailed(error),
+        Err(send_error) => {
+            ServerInitializeError::transport::<T>(send_error, "sending error response")
+        }
+    }
 }
 
 async fn serve_server_with_ct_inner<S, T>(
@@ -554,7 +610,7 @@ where
 
     let initialize_request = match request {
         ClientRequest::InitializeRequest(request) => request,
-        mut request => {
+        request => {
             let missing_metadata = request
                 .get_meta()
                 .missing_required_keys(&ProtocolVersion::V_2026_07_28);
@@ -577,21 +633,17 @@ where
             }
             let (peer, peer_rx) = Peer::new(id_provider, None);
             peer.require_request_metadata();
-            let context = RequestContext {
-                ct: ct.child_token(),
-                id: id.clone(),
-                meta: std::mem::take(request.get_meta_mut()),
-                extensions: std::mem::take(request.extensions_mut()),
-                peer: peer.clone(),
-            };
-            let response = match service.handle_request(request, context).await {
-                Ok(result) => ServerJsonRpcMessage::response(result, id),
-                Err(error) => ServerJsonRpcMessage::error(error, Some(id)),
-            };
-            transport.send(response).await.map_err(|error| {
-                ServerInitializeError::transport::<T>(error, "sending negotiated request response")
-            })?;
-            return Ok(serve_inner(service, transport, peer, peer_rx, ct));
+            // Dispatch the request from inside the service loop rather than
+            // inline: its handler may send notifications through `peer`, which
+            // only complete once the loop drains `peer_rx`.
+            return Ok(serve_inner(
+                service,
+                transport,
+                peer,
+                peer_rx,
+                VecDeque::from([ClientJsonRpcMessage::request(request, id)]),
+                ct,
+            ));
         }
     };
     let requested_protocol_version = initialize_request.params.protocol_version.clone();
@@ -606,27 +658,21 @@ where
         peer: peer.clone(),
     };
     // Send initialize response
-    let init_response = service.handle_request(request, context).await;
-    let mut init_response = match init_response {
+    let mut init_response = match service.handle_request(request, context).await {
         Ok(ServerResult::InitializeResult(init_response)) => init_response,
         Ok(result) => {
             return Err(ServerInitializeError::UnexpectedInitializeResponse(result));
         }
-        Err(e) => {
-            transport
-                .send(ServerJsonRpcMessage::error(e.clone(), Some(id)))
-                .await
-                .map_err(|error| {
-                    ServerInitializeError::transport::<T>(error, "sending error response")
-                })?;
-            return Err(ServerInitializeError::InitializeFailed(e));
-        }
+        Err(e) => return Err(report_initialize_failure(&mut transport, e, id).await),
     };
-    init_response.protocol_version = negotiate_protocol_version(
+    init_response.protocol_version = match negotiate_protocol_version(
         &requested_protocol_version,
         init_response.protocol_version,
         &service.supported_protocol_versions(),
-    );
+    ) {
+        Ok(version) => version,
+        Err(e) => return Err(report_initialize_failure(&mut transport, e, id).await),
+    };
     // Update peer_info so context.protocol_version() reflects the negotiated
     // version in all subsequent request handlers.
     negotiated_peer_info.protocol_version = init_response.protocol_version.clone();
@@ -647,7 +693,14 @@ where
     // Streamable HTTP has no ordering guarantee between POSTs, and the MCP spec uses
     // SHOULD NOT (not MUST NOT) for pre-initialized messages, so any request arriving
     // before initialized is processed normally.
-    Ok(serve_inner(service, transport, peer, peer_rx, ct))
+    Ok(serve_inner(
+        service,
+        transport,
+        peer,
+        peer_rx,
+        VecDeque::new(),
+        ct,
+    ))
 }
 
 macro_rules! method {

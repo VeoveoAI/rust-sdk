@@ -17,9 +17,9 @@ use std::{
 use rmcp::{
     ClientHandler, ClientServiceExt, ServerHandler, ServiceExt,
     model::{
-        ClientCapabilities, ClientInfo, ClientNotification, ClientRequest, DetailedTask,
+        ClientCapabilities, ClientConfig, ClientNotification, ClientRequest, DetailedTask,
         DiscoverResult, ErrorCode, GetMeta, Implementation, NotificationMetaObject,
-        PromptListChangedNotification, ProtocolVersion, ServerCapabilities, ServerInfo,
+        PromptListChangedNotification, ProtocolVersion, ServerCapabilities, ServerConfig,
         ServerNotification, ServerResult, SubscriptionFilter,
         SubscriptionsAcknowledgedNotification, SubscriptionsAcknowledgedNotificationParams,
         SubscriptionsListenResult, Task, TaskPayload, TaskStatus, TaskStatusNotification,
@@ -46,8 +46,8 @@ impl ClientHandler for CountingClient {
 }
 
 impl ServerHandler for ToolsOnlyServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_tool_list_changed()
@@ -82,8 +82,8 @@ impl ServerHandler for ToolsOnlyServer {
 struct ToolsAndPromptsServer;
 
 impl ServerHandler for ToolsAndPromptsServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_tool_list_changed()
@@ -122,8 +122,8 @@ impl ServerHandler for ToolsAndPromptsServer {
 struct ResourceSubscriptionServer;
 
 impl ServerHandler for ResourceSubscriptionServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(
             ServerCapabilities::builder()
                 .enable_resources()
                 .enable_resources_subscribe()
@@ -174,8 +174,8 @@ fn working_task(task_id: &str) -> DetailedTask {
 }
 
 impl ServerHandler for TaskSubscriptionServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tasks().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tasks().build())
     }
 
     fn accepted_subscription_filter(
@@ -237,8 +237,8 @@ impl ServerHandler for RemoteCancellationServer {
 struct FloodServer;
 
 impl ServerHandler for FloodServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_tool_list_changed()
@@ -274,8 +274,8 @@ struct LeakyServer;
 struct LeakyTaskServer;
 
 impl ServerHandler for LeakyServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_tool_list_changed()
@@ -310,8 +310,8 @@ impl ServerHandler for LeakyServer {
 }
 
 impl ServerHandler for LeakyTaskServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tasks().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tasks().build())
     }
 
     fn accepted_subscription_filter(
@@ -401,14 +401,14 @@ impl rmcp::service::Service<RoleServer> for MalformedAcknowledgmentServer {
         Ok(())
     }
 
-    fn get_info(&self) -> rmcp::model::ServerInfo {
-        ServerInfo::default()
+    fn get_info(&self) -> rmcp::model::ServerConfig {
+        ServerConfig::default()
     }
 }
 
 impl ServerHandler for ClosedSinkServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_tool_list_changed()
@@ -489,14 +489,14 @@ async fn modern_client<S: ServerHandler>(
 
 async fn modern_tasks_client<S: ServerHandler>(
     server: S,
-) -> anyhow::Result<rmcp::service::RunningService<rmcp::RoleClient, ClientInfo>> {
+) -> anyhow::Result<rmcp::service::RunningService<rmcp::RoleClient, ClientConfig>> {
     let (server_transport, client_transport) = tokio::io::duplex(16 * 1024);
     tokio::spawn(async move {
         let server = server.serve(server_transport).await?;
         server.waiting().await?;
         anyhow::Ok(())
     });
-    ClientInfo::new(
+    ClientConfig::new(
         ClientCapabilities::builder().enable_tasks().build(),
         Implementation::new("tasks-client", "1.0.0"),
     )
