@@ -172,10 +172,34 @@ impl ProtocolVersion {
     pub const V_2025_06_18: Self = Self(Cow::Borrowed("2025-06-18"));
     pub const V_2025_03_26: Self = Self(Cow::Borrowed("2025-03-26"));
     pub const V_2024_11_05: Self = Self(Cow::Borrowed("2024-11-05"));
-    pub const LATEST: Self = Self::V_2025_11_25;
+
+    /// The newest protocol version known to this SDK.
+    pub const LATEST: Self = Self::V_2026_07_28;
 
     /// First protocol version that requires SEP-2243 standard HTTP headers.
     pub const STANDARD_HEADERS: Self = Self::V_2026_07_28;
+
+    /// First protocol version that replaced the `initialize` handshake with
+    /// per-request `_meta` (SEP-2567).
+    pub const NO_INITIALIZE: Self = Self::V_2026_07_28;
+
+    /// The newest protocol version that still has an `initialize` handshake.
+    ///
+    /// From [`Self::NO_INITIALIZE`] onward the lifecycle moved into per-request
+    /// `_meta`, so there is no handshake left to answer. A server replying to
+    /// `initialize` can therefore never name [`Self::LATEST`] once `LATEST`
+    /// reaches that revision — it has to name this one instead.
+    ///
+    /// Use this, not `LATEST`, whenever the subject is the handshake itself:
+    /// the version a server can echo from `initialize`, or the version a test
+    /// needs in order to exercise session-based behavior.
+    ///
+    /// ```
+    /// # use rmcp::model::ProtocolVersion;
+    /// assert!(ProtocolVersion::LATEST_WITH_INITIALIZE.has_initialize());
+    /// assert!(!ProtocolVersion::LATEST.has_initialize());
+    /// ```
+    pub const LATEST_WITH_INITIALIZE: Self = Self::V_2025_11_25;
 
     /// All protocol versions known to this SDK, oldest first.
     pub const KNOWN_VERSIONS: &[Self] = &[
@@ -189,6 +213,23 @@ impl ProtocolVersion {
     /// Returns the string representation of this protocol version.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// Whether this revision negotiates its lifecycle over the `initialize`
+    /// handshake.
+    ///
+    /// `false` from [`Self::NO_INITIALIZE`] onward, where SEP-2567 moved the
+    /// lifecycle into per-request `_meta`. Unknown versions are compared
+    /// lexically, which orders correctly because every revision is dated
+    /// `YYYY-MM-DD`.
+    ///
+    /// ```
+    /// # use rmcp::model::ProtocolVersion;
+    /// assert!(ProtocolVersion::V_2025_11_25.has_initialize());
+    /// assert!(!ProtocolVersion::V_2026_07_28.has_initialize());
+    /// ```
+    pub fn has_initialize(&self) -> bool {
+        self.as_str() < Self::NO_INITIALIZE.as_str()
     }
 
     /// The known versions up to and including `max`, oldest first.
@@ -1592,9 +1633,14 @@ const_string!(ProgressNotificationMethod = "notifications/progress");
 pub struct ProgressNotificationParam {
     pub progress_token: ProgressToken,
     /// The progress thus far. This should increase every time progress is made, even if the total is unknown.
+    #[serde(deserialize_with = "serde_impl::json_float::f64")]
     pub progress: f64,
     /// Total number of items to process (or total progress required), if known
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "serde_impl::json_float::option_f64",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub total: Option<f64>,
     /// An optional message describing the current progress.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1660,6 +1706,27 @@ where
     Ok(value.map(|ttl_ms| ttl_ms.max(0) as u64))
 }
 
+/// Normalize a `cacheScope` value during deserialization.
+///
+/// Per SEP-2549, `cacheScope` MUST be `"public"`, `"private"`, or absent; some
+/// servers instead send `""`. Because `ServerResult` is `#[serde(untagged)]`,
+/// letting that value hard-error here would silently fall through to
+/// `CustomResult` and drop the entire (otherwise valid) result. Treat an empty
+/// string the same as an absent field rather than erroring.
+fn deserialize_cache_scope<'de, D>(deserializer: D) -> Result<Option<CacheScope>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) if s.is_empty() => Ok(None),
+        Some(value) => CacheScope::deserialize(value)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+    }
+}
+
 macro_rules! paginated_result {
     ($t:ident {
         $i_item: ident: $t_item: ty
@@ -1697,7 +1764,11 @@ macro_rules! paginated_result {
             /// Scope describing who may cache this result (SEP-2549).
             /// Required by spec version 2026-07-28, but optional here to maintain compatibility
             /// with older spec versions.
-            #[serde(default, skip_serializing_if = "Option::is_none")]
+            #[serde(
+                default,
+                deserialize_with = "deserialize_cache_scope",
+                skip_serializing_if = "Option::is_none"
+            )]
             pub cache_scope: Option<CacheScope>,
             pub $i_item: $t_item,
         }
@@ -1847,7 +1918,11 @@ pub struct ReadResourceResult {
     /// Scope describing who may cache this result (SEP-2549).
     /// Required by spec version 2026-07-28, but optional here to maintain compatibility
     /// with older spec versions.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_cache_scope",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub cache_scope: Option<CacheScope>,
     /// The actual content of the resource
     pub contents: Vec<ResourceContents>,
@@ -3011,7 +3086,11 @@ pub struct CreateMessageRequestParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub include_context: Option<ContextInclusion>,
     /// Temperature for controlling randomness (0.0 to 1.0)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "serde_impl::json_float::option_f32",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub temperature: Option<f32>,
     /// Maximum number of tokens to generate
     pub max_tokens: u32,
@@ -3200,13 +3279,25 @@ pub struct ModelPreferences {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hints: Option<Vec<ModelHint>>,
     /// Priority for cost optimization (0.0 to 1.0, higher = prefer cheaper models)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "serde_impl::json_float::option_f32",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub cost_priority: Option<f32>,
     /// Priority for speed/latency (0.0 to 1.0, higher = prefer faster models)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "serde_impl::json_float::option_f32",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub speed_priority: Option<f32>,
     /// Priority for intelligence/capability (0.0 to 1.0, higher = prefer more capable models)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "serde_impl::json_float::option_f32",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub intelligence_priority: Option<f32>,
 }
 
@@ -3907,6 +3998,15 @@ pub type ElicitRequest = Request<ElicitationCreateRequestMethod, ElicitRequestPa
 // TOOL EXECUTION RESULTS
 // =============================================================================
 
+/// Deserialize a field that is present on the wire as `Some`, even when its
+/// value is `null`. Combined with `#[serde(default)]`, an absent field stays `None`.
+fn deserialize_present_value<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Value::deserialize(deserializer).map(Some)
+}
+
 /// The result of a tool call operation.
 ///
 /// Contains the content returned by the tool execution and an optional
@@ -3931,7 +4031,9 @@ pub struct CallToolResult {
     /// The content returned by the tool (text, images, etc.)
     #[serde(default)]
     pub content: Vec<ContentBlock>,
-    /// An optional JSON object that represents the structured result of the tool call
+    /// An optional JSON value that represents the structured result of the tool call.
+    /// It can be any JSON value, including `null`; an explicit `null` is kept
+    /// distinct from an absent field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub structured_content: Option<Value>,
     /// Whether this result represents an error condition
@@ -3948,6 +4050,8 @@ pub struct CallToolResult {
 //    greedily match arbitrary JSON objects when used inside `#[serde(untagged)]` enums
 //    (e.g. `ServerResult`), which would shadow `CustomResult`.
 // 3. Rejects non-`complete` result types so other `ServerResult` variants can match.
+// 4. Keeps a present `"structuredContent": null` as `Some(Value::Null)`, distinct
+//    from an absent field, since structured content can be any JSON value.
 impl<'de> Deserialize<'de> for CallToolResult {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -3959,6 +4063,7 @@ impl<'de> Deserialize<'de> for CallToolResult {
             #[serde(default)]
             result_type: Option<ResultType>,
             content: Option<Vec<ContentBlock>>,
+            #[serde(default, deserialize_with = "deserialize_present_value")]
             structured_content: Option<Value>,
             is_error: Option<bool>,
             #[serde(rename = "_meta")]
@@ -4784,6 +4889,34 @@ mod tests {
                 .windows(2)
                 .all(|pair| pair[0].as_str() < pair[1].as_str())
         );
+    }
+
+    // Guards the pair of constants this SDK's negotiation rests on. `LATEST`
+    // and `LATEST_WITH_INITIALIZE` were the same value until `LATEST` reached
+    // `NO_INITIALIZE`; conflating them is what made bumping `LATEST` expensive.
+    #[test]
+    fn latest_with_initialize_is_the_newest_known_version_that_has_one() {
+        let derived = ProtocolVersion::KNOWN_VERSIONS
+            .iter()
+            .filter(|version| version.has_initialize())
+            .max_by(|left, right| left.as_str().cmp(right.as_str()))
+            .expect("some known version should have an initialize handshake");
+        assert_eq!(
+            derived,
+            &ProtocolVersion::LATEST_WITH_INITIALIZE,
+            "LATEST_WITH_INITIALIZE must track KNOWN_VERSIONS"
+        );
+    }
+
+    #[test]
+    fn has_initialize_splits_known_versions_at_no_initialize() {
+        for version in ProtocolVersion::KNOWN_VERSIONS {
+            assert_eq!(
+                version.has_initialize(),
+                version.as_str() < ProtocolVersion::NO_INITIALIZE.as_str(),
+                "{version} classified inconsistently"
+            );
+        }
     }
 
     #[test]

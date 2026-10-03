@@ -280,6 +280,13 @@ impl StreamableHttpClient for reqwest::Client {
                 .text()
                 .await
                 .unwrap_or_else(|_| "<failed to read response body>".to_owned());
+            // Must precede the JSON-RPC branch below, which would forward a
+            // discover rejection with an id the lifecycle cannot correlate.
+            if let Some(response) =
+                legacy_discover_response(&message, session_was_attached, status, &body)
+            {
+                return Ok(response);
+            }
             if content_type
                 .as_deref()
                 .is_some_and(|ct| ct.as_bytes().starts_with(JSON_MIME_TYPE.as_bytes()))
@@ -293,14 +300,7 @@ impl StreamableHttpClient for reqwest::Client {
                     ),
                 }
             }
-            if let Some(response) =
-                legacy_discover_response(&message, session_was_attached, status, &body)
-            {
-                return Ok(response);
-            }
-            return Err(StreamableHttpError::UnexpectedServerResponse(Cow::Owned(
-                format!("HTTP {status}: {body}"),
-            )));
+            return Err(StreamableHttpError::HttpResponse { status, body });
         }
         match content_type.as_deref() {
             Some(ct) if ct.as_bytes().starts_with(EVENT_STREAM_MIME_TYPE.as_bytes()) => {
@@ -623,7 +623,10 @@ mod tests {
         assert!(
             matches!(
                 result,
-                Err(StreamableHttpError::UnexpectedServerResponse(_))
+                Err(StreamableHttpError::HttpResponse {
+                    status: StatusCode::TEMPORARY_REDIRECT,
+                    ..
+                })
             ),
             "redirect response should be returned to the transport, got {result:?}"
         );
