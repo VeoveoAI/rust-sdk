@@ -1138,7 +1138,13 @@ impl<C: StreamableHttpClient> Worker for StreamableHttpClientWorker<C> {
             }
             Err(err) => {
                 let msg = format!("{:?}", err);
-                let _ = responder.send(Err(err));
+                if responder.send(Err(err)).is_ok() {
+                    // The caller holds the startup error and decides what it means, such
+                    // as reconnecting to a server that is being replaced. The worker only
+                    // ends, so this is not a fatal transport failure of its own.
+                    tracing::debug!("worker quit after its startup request failed: {msg}");
+                    return Err(WorkerQuitReason::TransportClosed);
+                }
                 return Err(WorkerQuitReason::fatal(
                     StreamableHttpError::TransportChannelClosed,
                     msg,
@@ -2615,5 +2621,164 @@ mod tests {
 
         assert_eq!(matched_id, Some(string_id));
         assert_eq!(pending, HashSet::from([NumberOrString::Number(1)]));
+    }
+    /// The level and message of every event logged on this thread while the guard lives.
+    #[derive(Clone, Default)]
+    struct Events(Arc<Mutex<Vec<(tracing::Level, String)>>>);
+
+    struct Message(String);
+
+    impl tracing::field::Visit for Message {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = format!("{value:?}");
+            }
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Events {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut message = Message(String::new());
+            event.record(&mut message);
+            self.0
+                .lock()
+                .expect("lock events")
+                .push((*event.metadata().level(), message.0));
+        }
+    }
+
+    impl Events {
+        fn capture() -> (Self, tracing::subscriber::DefaultGuard) {
+            use tracing_subscriber::layer::SubscriberExt as _;
+            let events = Self::default();
+            let guard = tracing::subscriber::set_default(
+                tracing_subscriber::registry().with(events.clone()),
+            );
+            (events, guard)
+        }
+
+        fn at(&self, level: tracing::Level) -> Vec<String> {
+            self.0
+                .lock()
+                .expect("lock events")
+                .iter()
+                .filter(|(at, _)| *at == level)
+                .map(|(_, message)| message.clone())
+                .collect()
+        }
+    }
+
+    /// A client whose every POST fails once `gate` opens.
+    #[derive(Clone, Default)]
+    struct FailingPostClient {
+        gate: Arc<tokio::sync::Notify>,
+    }
+
+    impl StreamableHttpClient for FailingPostClient {
+        type Error = std::io::Error;
+
+        async fn post_message(
+            &self,
+            _uri: Arc<str>,
+            _message: ClientJsonRpcMessage,
+            _session_id: Option<Arc<str>>,
+            _auth_header: Option<String>,
+            _custom_headers: HashMap<HeaderName, HeaderValue>,
+        ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
+            self.gate.notified().await;
+            Err(StreamableHttpError::Client(std::io::Error::other(
+                "connection closed before message completed",
+            )))
+        }
+
+        async fn delete_session(
+            &self,
+            _uri: Arc<str>,
+            _session_id: Arc<str>,
+            _auth_header: Option<String>,
+            _custom_headers: HashMap<HeaderName, HeaderValue>,
+        ) -> Result<(), StreamableHttpError<Self::Error>> {
+            Ok(())
+        }
+
+        async fn get_stream(
+            &self,
+            _uri: Arc<str>,
+            _session_id: Option<Arc<str>>,
+            _last_event_id: Option<String>,
+            _auth_header: Option<String>,
+            _custom_headers: HashMap<HeaderName, HeaderValue>,
+        ) -> Result<BoxedSseStream, StreamableHttpError<Self::Error>> {
+            Err(StreamableHttpError::ServerDoesNotSupportSse)
+        }
+    }
+
+    fn ping() -> ClientJsonRpcMessage {
+        serde_json::from_value(json!({"jsonrpc": "2.0", "id": 1, "method": "ping"}))
+            .expect("a ping request")
+    }
+
+    fn worker(
+        client: FailingPostClient,
+    ) -> WorkerTransport<StreamableHttpClientWorker<FailingPostClient>> {
+        WorkerTransport::spawn(StreamableHttpClientWorker::new(
+            client,
+            StreamableHttpClientTransportConfig::with_uri("http://127.0.0.1:1/mcp"),
+        ))
+    }
+
+    #[tokio::test]
+    async fn a_startup_failure_the_caller_receives_ends_the_worker_at_debug() {
+        let (events, _guard) = Events::capture();
+        let client = FailingPostClient::default();
+        client.gate.notify_one();
+        let mut transport = worker(client);
+        let sent = crate::transport::Transport::send(&mut transport, ping()).await;
+        assert!(
+            matches!(sent, Err(StreamableHttpError::Client(_))),
+            "the caller receives the startup error: {sent:?}"
+        );
+        crate::transport::Transport::close(&mut transport)
+            .await
+            .expect("close the transport");
+        assert_eq!(events.at(tracing::Level::ERROR), Vec::<String>::new());
+        assert!(
+            events
+                .at(tracing::Level::DEBUG)
+                .iter()
+                .any(|message| message.starts_with("worker quit after its startup request failed")),
+            "{:?}",
+            events.at(tracing::Level::DEBUG)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_startup_failure_no_caller_receives_stays_a_fatal_error() {
+        let (events, _guard) = Events::capture();
+        let client = FailingPostClient::default();
+        let mut transport = worker(client.clone());
+        // The caller gives up while the startup request is in flight.
+        let sent = tokio::time::timeout(
+            Duration::from_millis(50),
+            crate::transport::Transport::send(&mut transport, ping()),
+        )
+        .await;
+        assert!(sent.is_err(), "the startup request is still in flight");
+        client.gate.notify_one();
+        crate::transport::Transport::close(&mut transport)
+            .await
+            .expect("close the transport");
+        assert!(
+            events
+                .at(tracing::Level::ERROR)
+                .iter()
+                .any(|message| message.starts_with("worker quit with fatal")),
+            "{:?}",
+            events.at(tracing::Level::ERROR)
+        );
     }
 }
