@@ -84,10 +84,9 @@ async fn http_4xx_json_rpc_error_body_is_surfaced_as_json_response() {
     }
 }
 
-/// HTTP 4xx with non-JSON content-type must still return `UnexpectedServerResponse`
-/// (no regression on the original error path).
+/// HTTP rejections retain their status and diagnostic body as typed fields.
 #[tokio::test]
-async fn http_4xx_non_json_body_returns_unexpected_server_response() {
+async fn http_4xx_non_json_body_retains_http_status() {
     let url = spawn_mock_server(400, "text/plain", "Bad Request").await;
 
     let client = reqwest::Client::new();
@@ -102,15 +101,18 @@ async fn http_4xx_non_json_body_returns_unexpected_server_response() {
         .await;
 
     match result {
-        Err(StreamableHttpError::UnexpectedServerResponse(_)) => {}
-        other => panic!("expected UnexpectedServerResponse, got: {other:?}"),
+        Err(StreamableHttpError::HttpResponse { status, body }) => {
+            assert_eq!(status.as_u16(), 400);
+            assert_eq!(body, "Bad Request");
+        }
+        other => panic!("expected typed HTTP rejection, got: {other:?}"),
     }
 }
 
 /// HTTP 4xx with Content-Type: application/json but a body that is NOT a valid
-/// JSON-RPC message must fall back to `UnexpectedServerResponse`.
+/// JSON-RPC message must retain the HTTP rejection.
 #[tokio::test]
-async fn http_4xx_malformed_json_body_falls_back_to_unexpected_server_response() {
+async fn http_4xx_malformed_json_body_retains_http_status() {
     let url = spawn_mock_server(400, "application/json", r#"{"error":"not jsonrpc"}"#).await;
 
     let client = reqwest::Client::new();
@@ -125,8 +127,11 @@ async fn http_4xx_malformed_json_body_falls_back_to_unexpected_server_response()
         .await;
 
     match result {
-        Err(StreamableHttpError::UnexpectedServerResponse(_)) => {}
-        other => panic!("expected UnexpectedServerResponse, got: {other:?}"),
+        Err(StreamableHttpError::HttpResponse { status, body }) => {
+            assert_eq!(status.as_u16(), 400);
+            assert_eq!(body, "{\"error\":\"not jsonrpc\"}");
+        }
+        other => panic!("expected typed HTTP rejection, got: {other:?}"),
     }
 }
 
@@ -148,15 +153,35 @@ async fn sessionful_discover_4xx_does_not_trigger_legacy_fallback() {
         .await;
 
     match result {
-        Err(StreamableHttpError::UnexpectedServerResponse(_)) => {}
-        other => panic!("expected UnexpectedServerResponse, got: {other:?}"),
+        Err(StreamableHttpError::HttpResponse { status, body }) => {
+            assert_eq!(status.as_u16(), 422);
+            assert_eq!(body, "Session-bound rejection");
+        }
+        other => panic!("expected typed HTTP rejection, got: {other:?}"),
+    }
+}
+
+/// An oversized request rejection must survive the client transport intact.
+#[tokio::test]
+async fn oversized_request_retains_payload_too_large() {
+    let url = spawn_mock_server(413, "text/plain", "request body exceeds 2097152 bytes").await;
+    let error = reqwest::Client::new()
+        .post_message(Arc::from(url), ping_message(), None, None, HashMap::new())
+        .await
+        .unwrap_err();
+    match error {
+        StreamableHttpError::HttpResponse { status, body } => {
+            assert_eq!(status, http::StatusCode::PAYLOAD_TOO_LARGE);
+            assert_eq!(body, "request body exceeds 2097152 bytes");
+        }
+        other => panic!("expected typed HTTP rejection, got: {other:?}"),
     }
 }
 
 const JSON_RPC_ERROR_BODY: &str =
     r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32001,"message":"Unauthorized"}}"#;
 
-async fn post_ping_expecting_status_error(status: u16, expected_prefix: &str) {
+async fn post_ping_expecting_status_error(status: u16) {
     let url = spawn_mock_server(status, "application/json", JSON_RPC_ERROR_BODY).await;
 
     let client = reqwest::Client::new();
@@ -171,13 +196,14 @@ async fn post_ping_expecting_status_error(status: u16, expected_prefix: &str) {
         .await;
 
     match result {
-        Err(StreamableHttpError::UnexpectedServerResponse(message)) => {
-            assert!(
-                message.starts_with(expected_prefix),
-                "expected message starting with {expected_prefix:?}, got: {message}"
-            );
+        Err(StreamableHttpError::HttpResponse {
+            status: rejected,
+            body,
+        }) => {
+            assert_eq!(rejected.as_u16(), status);
+            assert_eq!(body, JSON_RPC_ERROR_BODY);
         }
-        other => panic!("expected UnexpectedServerResponse, got: {other:?}"),
+        other => panic!("expected typed HTTP rejection, got: {other:?}"),
     }
 }
 
@@ -186,11 +212,11 @@ async fn post_ping_expecting_status_error(status: u16, expected_prefix: &str) {
 /// reach the caller, as it does for a plain-text 401.
 #[tokio::test]
 async fn http_401_json_rpc_error_body_without_challenge_keeps_status() {
-    post_ping_expecting_status_error(401, "HTTP 401 Unauthorized").await;
+    post_ping_expecting_status_error(401).await;
 }
 
 /// Same as above for 403 without `WWW-Authenticate`.
 #[tokio::test]
 async fn http_403_json_rpc_error_body_without_challenge_keeps_status() {
-    post_ping_expecting_status_error(403, "HTTP 403 Forbidden").await;
+    post_ping_expecting_status_error(403).await;
 }
