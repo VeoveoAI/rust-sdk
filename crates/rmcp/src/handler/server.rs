@@ -180,6 +180,18 @@ impl<H: ServerHandler> Service<RoleServer> for H {
                     Err(McpError::method_not_found::<SubscriptionsListenRequestMethod>())
                 } else {
                     let requested = request.params.notifications;
+                    if requested
+                        .task_ids
+                        .as_ref()
+                        .is_some_and(|task_ids| !task_ids.is_empty())
+                        && !context
+                            .client_capabilities()
+                            .is_some_and(|capabilities| capabilities.supports_tasks())
+                    {
+                        return Err(McpError::missing_required_client_capability(
+                            ClientCapabilities::builder().enable_tasks().build(),
+                        ));
+                    }
                     let Some(candidate) = self.accepted_subscription_filter(&requested) else {
                         return Err(
                             McpError::method_not_found::<SubscriptionsListenRequestMethod>(),
@@ -197,6 +209,8 @@ impl<H: ServerHandler> Service<RoleServer> for H {
                                 .map_or(0, Vec::len),
                             accepted_resource_count =
                                 accepted.resource_subscriptions.as_ref().map_or(0, Vec::len),
+                            requested_task_count = requested.task_ids.as_ref().map_or(0, Vec::len),
+                            accepted_task_count = accepted.task_ids.as_ref().map_or(0, Vec::len),
                             "subscription filter reduced to advertised server capabilities"
                         );
                     }

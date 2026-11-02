@@ -18,9 +18,9 @@ use std::{
 use rmcp::{
     ClientLifecycleMode, ClientServiceExt, ServerHandler,
     model::{
-        ClientConfig, ClientRequest, Implementation, ListToolsRequest, ProtocolVersion,
-        RequestMetaObject, ServerCapabilities, ServerConfig, ServerNotification,
-        SubscriptionFilter,
+        ClientCapabilities, ClientConfig, ClientRequest, DetailedTask, Implementation,
+        ListToolsRequest, ProtocolVersion, RequestMetaObject, ServerCapabilities, ServerConfig,
+        ServerNotification, SubscriptionFilter, Task, TaskPayload, TaskStatus,
     },
     service::{PeerRequestOptions, SubscriptionContext, SubscriptionEnd},
     transport::{
@@ -58,6 +58,7 @@ impl ServerHandler for HttpSubscriptionServer {
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_tool_list_changed()
+                .enable_tasks()
                 .build(),
         )
         .with_server_info(Implementation::new("http-subscription-server", "1.0.0"))
@@ -67,15 +68,39 @@ impl ServerHandler for HttpSubscriptionServer {
         &self,
         requested: &SubscriptionFilter,
     ) -> Option<SubscriptionFilter> {
-        Some(requested.supported_by(&self.get_info().capabilities))
+        let mut accepted = requested.supported_by(&self.get_info().capabilities);
+        if let Some(task_ids) = accepted.task_ids.as_mut() {
+            task_ids.retain(|task_id| task_id == "task-http");
+        }
+        Some(accepted)
     }
 
     async fn listen(&self, context: SubscriptionContext) -> Result<(), rmcp::ErrorData> {
-        context
-            .sink()
-            .notify_tool_list_changed()
-            .await
-            .expect("send tool notification");
+        if context.accepted().tools_list_changed == Some(true) {
+            context
+                .sink()
+                .notify_tool_list_changed()
+                .await
+                .expect("send tool notification");
+        }
+        if context
+            .accepted()
+            .task_ids
+            .as_ref()
+            .is_some_and(|task_ids| task_ids.iter().any(|task_id| task_id == "task-http"))
+        {
+            let task = Task::new(
+                "task-http",
+                TaskStatus::Working,
+                "2026-07-28T00:00:00Z",
+                "2026-07-28T00:00:01Z",
+            );
+            context
+                .sink()
+                .notify_task_status(DetailedTask::new(task, TaskPayload::Working))
+                .await
+                .expect("send task notification");
+        }
         self.started.notify_one();
         match self.ending {
             ServerEnding::Graceful => Ok(()),
@@ -229,6 +254,49 @@ async fn modern_http_graceful_close_returns_final_listen_result() -> anyhow::Res
             .expect("graceful result should contain valid server info"),
         Implementation::new("http-subscription-server", "1.0.0")
     );
+
+    client.cancel().await?;
+    server_ct.cancel();
+    Ok(())
+}
+
+#[tokio::test]
+async fn modern_http_delivers_task_status_on_the_listen_stream() -> anyhow::Result<()> {
+    let (url, server_ct, _, _, get_requests) = spawn_server(ServerEnding::Graceful).await;
+    let transport = StreamableHttpClientTransport::from_config(
+        StreamableHttpClientTransportConfig::with_uri(url),
+    );
+    let client = ClientConfig::new(
+        ClientCapabilities::builder().enable_tasks().build(),
+        Implementation::new("http-tasks-client", "1.0.0"),
+    )
+    .serve_with_lifecycle(
+        transport,
+        ClientLifecycleMode::Discover {
+            preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+        },
+    )
+    .await?;
+    let mut subscription = client
+        .listen(
+            SubscriptionFilter::builder()
+                .task_ids(["task-http", "task-not-authorized"])
+                .build(),
+        )
+        .await?;
+
+    assert_eq!(
+        subscription.acknowledged().task_ids,
+        Some(vec!["task-http".to_owned()])
+    );
+    let notification = subscription.next().await?.expect("task notification");
+    let ServerNotification::TaskStatusNotification(update) = notification else {
+        panic!("expected task status notification");
+    };
+    assert_eq!(update.params.task.task.task_id, "task-http");
+    assert_eq!(update.params.status(), TaskStatus::Working);
+    assert!(subscription.next().await?.is_none());
+    assert_eq!(get_requests.load(Ordering::Relaxed), 0);
 
     client.cancel().await?;
     server_ct.cancel();

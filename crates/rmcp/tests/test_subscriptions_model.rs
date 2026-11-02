@@ -13,6 +13,8 @@ fn subscription_filter_serializes_only_opted_in_notifications() {
         .tools_list_changed()
         .resource_subscription("file:///one")
         .resource_subscription("file:///two")
+        .task_id("task-1")
+        .task_id("task-2")
         .build();
 
     assert_eq!(
@@ -20,6 +22,7 @@ fn subscription_filter_serializes_only_opted_in_notifications() {
         json!({
             "toolsListChanged": true,
             "resourceSubscriptions": ["file:///one", "file:///two"],
+            "taskIds": ["task-1", "task-2"],
         })
     );
 }
@@ -29,13 +32,30 @@ fn subscription_filter_subset_is_order_independent_and_ignores_false_flags() {
     let requested = SubscriptionFilter::builder()
         .tools_list_changed()
         .resource_subscriptions(["file:///one", "file:///two"])
+        .task_ids(["task-1", "task-2"])
         .build();
     let mut accepted = SubscriptionFilter::builder()
         .resource_subscriptions(["file:///two", "file:///one"])
+        .task_ids(["task-2", "task-1"])
         .build();
     accepted.tools_list_changed = Some(false);
 
     assert!(accepted.is_subset_of(&requested));
+}
+
+#[test]
+fn subscription_filter_intersects_task_ids_in_requested_order() {
+    let requested = SubscriptionFilter::builder()
+        .task_ids(["task-3", "task-1", "task-2"])
+        .build();
+    let accepted = SubscriptionFilter::builder()
+        .task_ids(["task-2", "task-3"])
+        .build();
+
+    assert_eq!(
+        requested.intersection(&accepted).task_ids,
+        Some(vec!["task-3".to_owned(), "task-2".to_owned()])
+    );
 }
 
 #[test]
@@ -236,6 +256,7 @@ fn subscription_schemas_mark_only_draft_required_fields_as_required() {
         filter_schema["properties"]["resourceSubscriptions"]["type"],
         "array"
     );
+    assert_eq!(filter_schema["properties"]["taskIds"]["type"], "array");
     assert_eq!(acknowledgment_schema["required"], json!(["notifications"]));
     assert_eq!(
         acknowledgment_schema["properties"]["_meta"]["$ref"],

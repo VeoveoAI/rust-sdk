@@ -3617,6 +3617,13 @@
         "resourcesListChanged": {
           "type": "boolean"
         },
+        "taskIds": {
+          "description": "Task IDs whose `notifications/tasks` status updates the client wants.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
         "toolsListChanged": {
           "type": "boolean"
         }
