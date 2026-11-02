@@ -1823,7 +1823,12 @@ where
                         ct.cancel();
                     }
                     if let Err(error) = transport.send(m).await {
-                        tracing::error!(%error, "failed to send pending response during drain");
+                        // The peer may close its transport after requesting a
+                        // graceful shutdown. A response that finishes during
+                        // the drain window then has nowhere to go, but the
+                        // service is already terminal and no request can be
+                        // recovered by escalating this expected race.
+                        tracing::debug!(%error, "peer closed before a pending drain response was sent");
                         break;
                     }
                 }
