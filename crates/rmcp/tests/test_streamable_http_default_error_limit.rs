@@ -68,10 +68,7 @@ async fn default_client_truncates_error_body_without_exposing_the_tail() {
         .expect_err("an oversized HTTP error must fail")
         .to_string();
 
-    assert!(
-        error.starts_with("unexpected server response: HTTP 400"),
-        "{error}"
-    );
+    assert!(error.starts_with("HTTP 400 Bad Request: "), "{error}");
     assert!(
         error.contains(&"x".repeat(65_536)),
         "expected diagnostic prefix"

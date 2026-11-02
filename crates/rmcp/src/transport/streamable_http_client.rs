@@ -231,6 +231,13 @@ pub enum StreamableHttpError<E: std::error::Error + Send + Sync + 'static> {
     /// A non-streaming HTTP response exceeded the client's byte limit.
     #[error("HTTP response body exceeded the maximum size of {max_size} bytes")]
     ResponseBodyTooLarge { max_size: usize },
+    /// A non-success HTTP response without a valid JSON-RPC error payload.
+    /// The status remains available to callers without parsing diagnostic text.
+    #[error("HTTP {status}: {body}")]
+    HttpResponse {
+        status: http::StatusCode,
+        body: String,
+    },
     #[error("Unexpected content type: {0:?}")]
     UnexpectedContentType(Option<String>),
     #[error("Server does not support SSE")]

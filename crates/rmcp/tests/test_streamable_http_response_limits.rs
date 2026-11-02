@@ -324,7 +324,7 @@ enum Outcome {
     Status(u16),
     JsonResult,
     JsonError(i32),
-    Unexpected,
+    Rejected(u16),
     Accepted,
     SessionExpired,
     AuthRequired,
@@ -356,8 +356,9 @@ fn assert_outcome(result: PostResult, expected: Outcome) {
             Outcome::JsonError(code),
             Ok(StreamableHttpPostResponse::Json(JsonRpcMessage::Error(error), _)),
         ) if error.error.code.0 == code => assert_eq!(error.id, Some(RequestId::Number(1))),
-        (Outcome::Unexpected, Err(StreamableHttpError::UnexpectedServerResponse(_)))
-        | (Outcome::Accepted, Ok(StreamableHttpPostResponse::Accepted))
+        (Outcome::Rejected(code), Err(StreamableHttpError::HttpResponse { status, .. }))
+            if status.as_u16() == code => {}
+        (Outcome::Accepted, Ok(StreamableHttpPostResponse::Accepted))
         | (Outcome::SessionExpired, Err(StreamableHttpError::SessionExpired))
         | (Outcome::AuthRequired, Err(StreamableHttpError::AuthRequired(_)))
         | (Outcome::InsufficientScope, Err(StreamableHttpError::InsufficientScope(_))) => {}
@@ -559,18 +560,18 @@ async fn json_rpc_error_uses_json_limit_for_every_status(
 }
 
 #[rstest::rstest]
-#[case::request_length(Message::Request, Framing::Length, End::Close, Outcome::Unexpected)]
+#[case::request_length(Message::Request, Framing::Length, End::Close, Outcome::Rejected(400))]
 #[case::request_chunked_held_open(
     Message::Request,
     Framing::Chunked,
     End::Hold,
-    Outcome::Unexpected
+    Outcome::Rejected(400)
 )]
 #[case::request_huge_declared(
     Message::Request,
     Framing::Declared(HUGE_DECLARED),
     End::Hold,
-    Outcome::Unexpected
+    Outcome::Rejected(400)
 )]
 #[case::discover_length(
     Message::Discover,
@@ -602,9 +603,11 @@ async fn oversized_non_json_error_truncates_diagnostic_and_preserves_legacy_disc
     let server = serve(Reply::new(400, "text/plain", bytes.into()).framed(framing, end)).await;
     let result = post(&server, message, None).await;
     match (&result, expected) {
-        (Err(StreamableHttpError::UnexpectedServerResponse(actual)), Outcome::Unexpected) => {
-            assert!(actual.ends_with(&"x".repeat(MAX_ERROR_BODY)));
-            assert!(!actual.contains("DISCARDED_TAIL"));
+        (Err(StreamableHttpError::HttpResponse { status, body }), Outcome::Rejected(code))
+            if status.as_u16() == code =>
+        {
+            assert!(body.ends_with(&"x".repeat(MAX_ERROR_BODY)));
+            assert!(!body.contains("DISCARDED_TAIL"));
         }
         (
             Ok(StreamableHttpPostResponse::Json(JsonRpcMessage::Error(error), _)),
@@ -636,7 +639,7 @@ async fn truncated_diagnostics_cannot_be_parsed_as_json_rpc(#[case] framing: Fra
                 custom_limits(body.len(), ERROR_JSON.len(), 0),
             )
             .await,
-            Outcome::Unexpected,
+            Outcome::Rejected(400),
         );
         if content_type == "application/json" {
             assert_outcome(
@@ -654,8 +657,8 @@ async fn truncated_diagnostics_cannot_be_parsed_as_json_rpc(#[case] framing: Fra
 }
 
 #[rstest::rstest]
-#[case::unauthorized(401, Outcome::Unexpected)]
-#[case::forbidden(403, Outcome::Unexpected)]
+#[case::unauthorized(401, Outcome::Rejected(401))]
+#[case::forbidden(403, Outcome::Rejected(403))]
 #[case::server_error(500, Outcome::Status(500))]
 #[tokio::test]
 async fn truncated_diagnostics_do_not_expand_discovery_fallback(
@@ -701,15 +704,24 @@ async fn unchallenged_auth_failure_json_truncates_without_buffering_json_limit(
         serve(Reply::new(status, "application/json", bytes.into()).framed(framing, end)).await;
     let result =
         post_with_limits(&server, message, None, custom_limits(0, MAX_ERROR_BODY, 0)).await;
-    let Err(StreamableHttpError::UnexpectedServerResponse(actual)) = result else {
-        panic!(
-            "expected UnexpectedServerResponse, got {}",
-            summary(&result)
-        );
+    let Err(error @ StreamableHttpError::HttpResponse { .. }) = result else {
+        panic!("expected HttpResponse, got {}", summary(&result));
     };
-    assert!(actual.starts_with(&format!("HTTP {status}")), "{actual}");
-    assert!(actual.ends_with(&"x".repeat(MAX_ERROR_BODY)));
-    assert!(!actual.contains("DISCARDED_TAIL"));
+    let rendered = error.to_string();
+    let StreamableHttpError::HttpResponse {
+        status: rejected,
+        body,
+    } = error
+    else {
+        unreachable!()
+    };
+    assert_eq!(rejected.as_u16(), status);
+    assert!(
+        rendered.starts_with(&format!("HTTP {status}")),
+        "{rendered}"
+    );
+    assert!(body.ends_with(&"x".repeat(MAX_ERROR_BODY)));
+    assert!(!body.contains("DISCARDED_TAIL"));
 }
 
 /// An oversized JSON 5xx body drops the JSON-RPC error but keeps the
@@ -824,7 +836,7 @@ async fn declared_oversize_returns_before_any_body_bytes(
     Message::Request,
     Payload::Text,
     Framing::Length,
-    Outcome::Unexpected
+    Outcome::Rejected(400)
 )]
 #[case::discover_json_rpc_error(
     400,
@@ -968,8 +980,9 @@ async fn error_body_decoding_matches_reqwest_text(
         }
     } else {
         match result {
-            Err(StreamableHttpError::UnexpectedServerResponse(actual)) => {
-                assert_eq!(actual, format!("HTTP 400 Bad Request: {expected}"));
+            Err(StreamableHttpError::HttpResponse { status, body }) => {
+                assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+                assert_eq!(body, expected);
             }
             other => panic!("expected decoded HTTP error, got {}", summary(&other)),
         }
@@ -1012,9 +1025,17 @@ async fn oversized_charset_diagnostic_truncates_input_bytes_without_waiting_for_
     )
     .await;
     match post(&server, Message::Request, None).await {
-        Err(StreamableHttpError::UnexpectedServerResponse(actual)) => {
-            assert_eq!(actual, format!("HTTP 400 Bad Request: {expected}"));
-            assert!(!actual.contains("TAIL_MARKER"));
+        Err(error @ StreamableHttpError::HttpResponse { .. }) => {
+            assert_eq!(
+                error.to_string(),
+                format!("HTTP 400 Bad Request: {expected}")
+            );
+            let StreamableHttpError::HttpResponse { status, body } = error else {
+                unreachable!()
+            };
+            assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+            assert_eq!(body, expected);
+            assert!(!body.contains("TAIL_MARKER"));
         }
         other => panic!(
             "expected truncated decoded HTTP error, got {}",
@@ -1042,8 +1063,9 @@ async fn charset_limit_counts_input_bytes_before_text_expansion() {
         .unwrap();
     assert!(expected.len() > MAX_ERROR_BODY);
     match post(&server, Message::Request, None).await {
-        Err(StreamableHttpError::UnexpectedServerResponse(actual)) => {
-            assert_eq!(actual, format!("HTTP 400 Bad Request: {expected}"));
+        Err(StreamableHttpError::HttpResponse { status, body }) => {
+            assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+            assert_eq!(body, expected);
         }
         other => panic!("expected decoded HTTP error, got {}", summary(&other)),
     }
