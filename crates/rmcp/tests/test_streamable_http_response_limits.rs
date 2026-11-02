@@ -289,7 +289,7 @@ enum Outcome {
     Status(u16),
     JsonResult,
     JsonError(i32),
-    Unexpected,
+    Rejected(u16),
     Accepted,
     SessionExpired,
     AuthRequired,
@@ -320,8 +320,9 @@ fn assert_outcome(result: PostResult, expected: Outcome) {
             Outcome::JsonError(code),
             Ok(StreamableHttpPostResponse::Json(JsonRpcMessage::Error(error), _)),
         ) if error.error.code.0 == code => assert_eq!(error.id, Some(RequestId::Number(1))),
-        (Outcome::Unexpected, Err(StreamableHttpError::UnexpectedServerResponse(_)))
-        | (Outcome::Accepted, Ok(StreamableHttpPostResponse::Accepted))
+        (Outcome::Rejected(code), Err(StreamableHttpError::HttpResponse { status, .. }))
+            if status.as_u16() == code => {}
+        (Outcome::Accepted, Ok(StreamableHttpPostResponse::Accepted))
         | (Outcome::SessionExpired, Err(StreamableHttpError::SessionExpired))
         | (Outcome::AuthRequired, Err(StreamableHttpError::AuthRequired(_))) => {}
         (expected, _) => panic!("expected {expected:?}, got {rendered}"),
@@ -593,7 +594,7 @@ async fn declared_oversize_returns_before_any_body_bytes(
     Message::Request,
     Payload::Text,
     Framing::Length,
-    Outcome::Unexpected
+    Outcome::Rejected(400)
 )]
 #[case::discover_json_rpc_error(
     400,
@@ -703,8 +704,9 @@ async fn error_body_decoding_matches_reqwest_text(
         }
     } else {
         match result {
-            Err(StreamableHttpError::UnexpectedServerResponse(actual)) => {
-                assert_eq!(actual, format!("HTTP 400 Bad Request: {expected}"));
+            Err(StreamableHttpError::HttpResponse { status, body }) => {
+                assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+                assert_eq!(body, expected);
             }
             other => panic!("expected decoded HTTP error, got {}", summary(&other)),
         }
@@ -747,8 +749,9 @@ async fn charset_limit_counts_input_bytes_before_text_expansion() {
         .unwrap();
     assert!(expected.len() > MAX_ERROR_BODY);
     match post(&server, Message::Request, None).await {
-        Err(StreamableHttpError::UnexpectedServerResponse(actual)) => {
-            assert_eq!(actual, format!("HTTP 400 Bad Request: {expected}"));
+        Err(StreamableHttpError::HttpResponse { status, body }) => {
+            assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+            assert_eq!(body, expected);
         }
         other => panic!("expected decoded HTTP error, got {}", summary(&other)),
     }

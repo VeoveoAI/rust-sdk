@@ -373,9 +373,7 @@ impl StreamableHttpClient for reqwest::Client {
             if let Some(error) = status_error {
                 return Err(error.into());
             }
-            return Err(StreamableHttpError::UnexpectedServerResponse(Cow::Owned(
-                format!("HTTP {status}: {body}"),
-            )));
+            return Err(StreamableHttpError::HttpResponse { status, body });
         }
         match content_type.as_deref() {
             Some(ct) if ct.as_bytes().starts_with(EVENT_STREAM_MIME_TYPE.as_bytes()) => {
@@ -793,7 +791,10 @@ mod tests {
         assert!(
             matches!(
                 result,
-                Err(StreamableHttpError::UnexpectedServerResponse(_))
+                Err(StreamableHttpError::HttpResponse {
+                    status: StatusCode::TEMPORARY_REDIRECT,
+                    ..
+                })
             ),
             "redirect response should be returned to the transport, got {result:?}"
         );
@@ -1045,8 +1046,8 @@ mod tests {
         assert!(
             matches!(
                 &result,
-                Err(StreamableHttpError::UnexpectedServerResponse(message))
-                    if message.contains(status.as_str())
+                Err(StreamableHttpError::HttpResponse { status: rejected, .. })
+                    if *rejected == status
             ),
             "{status} should surface as an error, got {result:?}"
         );
