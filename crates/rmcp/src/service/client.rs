@@ -636,11 +636,15 @@ impl Subscription {
                 .resource_subscriptions
                 .as_ref()
                 .is_some_and(|uris| uris.contains(&update.params.uri)),
+            ServerNotification::TaskStatusNotification(update) => self
+                .acknowledged
+                .task_ids
+                .as_ref()
+                .is_some_and(|task_ids| task_ids.contains(&update.params.task.task.task_id)),
             ServerNotification::SubscriptionsAcknowledgedNotification(_)
             | ServerNotification::CancelledNotification(_)
             | ServerNotification::ProgressNotification(_)
             | ServerNotification::LoggingMessageNotification(_)
-            | ServerNotification::TaskStatusNotification(_)
             | ServerNotification::CustomNotification(_) => false,
         }
     }

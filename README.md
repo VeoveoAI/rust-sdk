@@ -1303,7 +1303,10 @@ impl ServerHandler for MyServer {
 The SDK intersects the handler's filter with the requested categories and the
 capabilities advertised by `get_info()`. It sends the acknowledgment before
 `listen`, tags every sink notification with the listen request ID, and rejects
-categories or resource URIs outside the accepted filter.
+categories, resource URIs, or task IDs outside the accepted filter. Task-status
+subscriptions additionally require both peers to declare the
+`io.modelcontextprotocol/tasks` extension; servers should acknowledge only task
+IDs accessible to the requesting principal.
 
 ### Client-side
 
@@ -1456,6 +1459,28 @@ async fn call_tool(&self, request: CallToolRequestParams, context: RequestContex
     // ... fall back to synchronous execution
 }
 ```
+
+Polling `tasks/get` is the default correctness path. Servers may also publish
+status changes to clients that explicitly requested the task ID through
+`subscriptions/listen`:
+
+```rust, ignore
+let mut subscription = client.listen(
+    SubscriptionFilter::builder().task_id(task_id.clone()).build(),
+).await?;
+
+// In ServerHandler::listen, after acknowledging an authorized task ID:
+context
+    .sink()
+    .notify_task_status(self.tasks.get_task(&task_id)?)
+    .await
+    .map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
+```
+
+Every `notifications/tasks` message carries the complete `DetailedTask` and is
+filtered by the task IDs in the acknowledged subscription. Notifications are
+optional; clients may continue polling and must not assume missed subscription
+messages will be replayed after reconnecting.
 
 See [`servers_task_stdio`](examples/servers/src/task_stdio.rs) and the matching
 [`clients_task_stdio`](examples/clients/src/task_stdio.rs) for a runnable end-to-end example.
