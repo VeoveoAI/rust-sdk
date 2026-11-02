@@ -17,11 +17,13 @@ use std::{
 use rmcp::{
     ClientHandler, ClientServiceExt, ServerHandler, ServiceExt,
     model::{
-        ClientNotification, ClientRequest, DiscoverResult, GetMeta, Implementation,
-        NotificationMetaObject, PromptListChangedNotification, ProtocolVersion, ServerCapabilities,
-        ServerConfig, ServerNotification, ServerResult, SubscriptionFilter,
+        ClientCapabilities, ClientConfig, ClientNotification, ClientRequest, DetailedTask,
+        DiscoverResult, ErrorCode, GetMeta, Implementation, NotificationMetaObject,
+        PromptListChangedNotification, ProtocolVersion, ServerCapabilities, ServerConfig,
+        ServerNotification, ServerResult, SubscriptionFilter,
         SubscriptionsAcknowledgedNotification, SubscriptionsAcknowledgedNotificationParams,
-        SubscriptionsListenResult,
+        SubscriptionsListenResult, Task, TaskPayload, TaskStatus, TaskStatusNotification,
+        TaskStatusNotificationParams,
     },
     service::{
         NotificationContext, RequestContext, RoleClient, RoleServer, SubscriptionContext,
@@ -155,6 +157,59 @@ impl ServerHandler for ResourceSubscriptionServer {
     }
 }
 
+struct TaskSubscriptionServer;
+
+fn working_task(task_id: &str) -> DetailedTask {
+    DetailedTask::new(
+        Task::new(
+            task_id,
+            TaskStatus::Working,
+            "2026-07-28T00:00:00Z",
+            "2026-07-28T00:00:01Z",
+        )
+        .with_ttl_ms(60_000)
+        .with_poll_interval_ms(1_000),
+        TaskPayload::Working,
+    )
+}
+
+impl ServerHandler for TaskSubscriptionServer {
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tasks().build())
+    }
+
+    fn accepted_subscription_filter(
+        &self,
+        requested: &SubscriptionFilter,
+    ) -> Option<SubscriptionFilter> {
+        Some(
+            requested.intersection(
+                &SubscriptionFilter::builder()
+                    .task_id("task-accepted")
+                    .build(),
+            ),
+        )
+    }
+
+    async fn listen(&self, context: SubscriptionContext) -> Result<(), rmcp::ErrorData> {
+        context
+            .sink()
+            .notify_task_status(working_task("task-accepted"))
+            .await
+            .expect("accepted task notification");
+        assert!(matches!(
+            context
+                .sink()
+                .notify_task_status(working_task("task-not-requested"))
+                .await,
+            Err(SubscriptionSendError::NotificationNotAccepted(
+                "notifications/tasks"
+            ))
+        ));
+        Ok(())
+    }
+}
+
 struct RemoteCancellationServer;
 
 impl ServerHandler for RemoteCancellationServer {
@@ -216,6 +271,8 @@ struct ClosedSinkServer {
 
 struct LeakyServer;
 
+struct LeakyTaskServer;
+
 impl ServerHandler for LeakyServer {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(
@@ -248,6 +305,36 @@ impl ServerHandler for LeakyServer {
             .send_notification(notification)
             .await
             .expect("send deliberately invalid notification");
+        std::future::pending().await
+    }
+}
+
+impl ServerHandler for LeakyTaskServer {
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tasks().build())
+    }
+
+    fn accepted_subscription_filter(
+        &self,
+        requested: &SubscriptionFilter,
+    ) -> Option<SubscriptionFilter> {
+        Some(requested.supported_by(&self.get_info().capabilities))
+    }
+
+    async fn listen(&self, context: SubscriptionContext) -> Result<(), rmcp::ErrorData> {
+        let mut notification =
+            ServerNotification::TaskStatusNotification(TaskStatusNotification::new(
+                TaskStatusNotificationParams::new(working_task("task-not-acknowledged")),
+            ));
+        notification
+            .get_meta_mut()
+            .set_subscription_id(context.sink().id().clone());
+        context
+            .request_context()
+            .peer
+            .send_notification(notification)
+            .await
+            .expect("send deliberately invalid task notification");
         std::future::pending().await
     }
 }
@@ -391,6 +478,29 @@ async fn modern_client<S: ServerHandler>(
         anyhow::Ok(())
     });
     ().serve_with_lifecycle(
+        client_transport,
+        rmcp::ClientLifecycleMode::Discover {
+            preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+        },
+    )
+    .await
+    .map_err(Into::into)
+}
+
+async fn modern_tasks_client<S: ServerHandler>(
+    server: S,
+) -> anyhow::Result<rmcp::service::RunningService<rmcp::RoleClient, ClientConfig>> {
+    let (server_transport, client_transport) = tokio::io::duplex(16 * 1024);
+    tokio::spawn(async move {
+        let server = server.serve(server_transport).await?;
+        server.waiting().await?;
+        anyhow::Ok(())
+    });
+    ClientConfig::new(
+        ClientCapabilities::builder().enable_tasks().build(),
+        Implementation::new("tasks-client", "1.0.0"),
+    )
+    .serve_with_lifecycle(
         client_transport,
         rmcp::ClientLifecycleMode::Discover {
             preferred_versions: vec![ProtocolVersion::V_2026_07_28],
@@ -582,6 +692,66 @@ async fn resource_updates_are_filtered_by_exact_uri_membership() -> anyhow::Resu
 }
 
 #[tokio::test]
+async fn task_notifications_are_filtered_and_delivered_by_exact_task_id() -> anyhow::Result<()> {
+    let client = modern_tasks_client(TaskSubscriptionServer).await?;
+    let mut subscription = client
+        .listen(
+            SubscriptionFilter::builder()
+                .task_ids(["task-accepted", "task-rejected"])
+                .build(),
+        )
+        .await?;
+
+    assert_eq!(
+        subscription.acknowledged().task_ids,
+        Some(vec!["task-accepted".to_owned()])
+    );
+    let notification = subscription.next().await?.expect("task notification");
+    assert_eq!(
+        notification.get_meta().subscription_id(),
+        Some(subscription.id().clone())
+    );
+    let ServerNotification::TaskStatusNotification(update) = notification else {
+        panic!("expected task status notification");
+    };
+    assert_eq!(update.params.task.task.task_id, "task-accepted");
+    assert_eq!(update.params.status(), TaskStatus::Working);
+    assert_eq!(update.params.task.task.ttl_ms, Some(60_000));
+    assert_eq!(update.params.task.task.poll_interval_ms, Some(1_000));
+    assert!(subscription.next().await?.is_none());
+    assert!(matches!(
+        subscription.end(),
+        Some(SubscriptionEnd::Graceful(_))
+    ));
+
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn task_subscription_requires_the_client_tasks_capability() -> anyhow::Result<()> {
+    let client = modern_client(TaskSubscriptionServer).await?;
+    let error = client
+        .listen(
+            SubscriptionFilter::builder()
+                .task_id("task-accepted")
+                .build(),
+        )
+        .await
+        .expect_err("client omitted the tasks extension capability");
+
+    match error {
+        rmcp::ServiceError::McpError(error) => {
+            assert_eq!(error.code, ErrorCode::MISSING_REQUIRED_CLIENT_CAPABILITY);
+        }
+        other => panic!("expected missing-capability MCP error, got {other:?}"),
+    }
+
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn stdio_server_cancellation_ends_the_matching_subscription() -> anyhow::Result<()> {
     let client = modern_client(RemoteCancellationServer).await?;
     let mut subscription = client.listen(SubscriptionFilter::new()).await?;
@@ -645,6 +815,27 @@ async fn client_rejects_notifications_outside_the_acknowledged_filter() -> anyho
     let client = modern_client(LeakyServer).await?;
     let mut subscription = client
         .listen(SubscriptionFilter::builder().tools_list_changed().build())
+        .await?;
+
+    assert!(matches!(
+        subscription.next().await,
+        Err(rmcp::ServiceError::UnexpectedResponse)
+    ));
+    assert!(matches!(subscription.end(), Some(SubscriptionEnd::Abrupt)));
+
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn client_rejects_task_notifications_for_unacknowledged_task_ids() -> anyhow::Result<()> {
+    let client = modern_tasks_client(LeakyTaskServer).await?;
+    let mut subscription = client
+        .listen(
+            SubscriptionFilter::builder()
+                .task_id("task-accepted")
+                .build(),
+        )
         .await?;
 
     assert!(matches!(

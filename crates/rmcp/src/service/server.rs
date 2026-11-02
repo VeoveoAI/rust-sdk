@@ -15,14 +15,14 @@ use crate::{
     model::{
         CancelledNotification, CancelledNotificationParam, ClientJsonRpcMessage,
         ClientNotification, ClientRequest, ClientResult, CreateMessageRequest,
-        CreateMessageRequestParams, CreateMessageResult, EmptyResult, ErrorData,
+        CreateMessageRequestParams, CreateMessageResult, DetailedTask, EmptyResult, ErrorData,
         InitializeRequestParams, ListRootsRequest, ListRootsResult, LoggingMessageNotification,
         LoggingMessageNotificationParam, ProgressNotification, ProgressNotificationParam,
         PromptListChangedNotification, ProtocolVersion, ResourceListChangedNotification,
         ResourceUpdatedNotification, ResourceUpdatedNotificationParam, ServerConfig,
         ServerNotification, ServerRequest, ServerResult, SubscriptionFilter,
         SubscriptionsAcknowledgedNotification, SubscriptionsAcknowledgedNotificationParams,
-        ToolListChangedNotification,
+        TaskStatusNotification, TaskStatusNotificationParams, ToolListChangedNotification,
     },
     transport::DynamicTransportError,
 };
@@ -208,6 +208,17 @@ impl SubscriptionSink {
                     ));
                 }
             }
+            ServerNotification::TaskStatusNotification(update) => {
+                let accepted =
+                    self.accepted.task_ids.as_ref().is_some_and(|task_ids| {
+                        task_ids.contains(&update.params.task.task.task_id)
+                    });
+                if !accepted {
+                    return Err(SubscriptionSendError::NotificationNotAccepted(
+                        "notifications/tasks",
+                    ));
+                }
+            }
             ServerNotification::SubscriptionsAcknowledgedNotification(_) => {
                 return Err(SubscriptionSendError::UnsupportedNotification(
                     "notifications/subscriptions/acknowledged",
@@ -226,16 +237,6 @@ impl SubscriptionSink {
             ServerNotification::LoggingMessageNotification(_) => {
                 return Err(SubscriptionSendError::UnsupportedNotification(
                     "notifications/message",
-                ));
-            }
-            // SEP-2663 task status notifications are not yet routable through
-            // `subscriptions/listen`: `SubscriptionFilter` has no `taskIds`
-            // field yet (the upstream conformance check for this flow is also
-            // still skipped, pending the subscriptions/listen rewrite).
-            // Clients currently observe task state by polling `tasks/get`.
-            ServerNotification::TaskStatusNotification(_) => {
-                return Err(SubscriptionSendError::UnsupportedNotification(
-                    "notifications/tasks",
                 ));
             }
             ServerNotification::CustomNotification(_) => {
@@ -308,6 +309,21 @@ impl SubscriptionSink {
     ) -> Result<(), SubscriptionSendError> {
         self.send(ServerNotification::ResourceUpdatedNotification(
             ResourceUpdatedNotification::new(ResourceUpdatedNotificationParam::new(uri)),
+        ))
+        .await
+    }
+
+    /// Send `notifications/tasks` for one accepted task ID.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::send`].
+    pub async fn notify_task_status(
+        &self,
+        task: DetailedTask,
+    ) -> Result<(), SubscriptionSendError> {
+        self.send(ServerNotification::TaskStatusNotification(
+            TaskStatusNotification::new(TaskStatusNotificationParams::new(task)),
         ))
         .await
     }
